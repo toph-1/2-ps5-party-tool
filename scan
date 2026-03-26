@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ===============================
-# PS5 SMART PARTY MONITOR v2
+# PS5 REAL ACTIVITY MONITOR
 # ===============================
 
 if [ "$EUID" -ne 0 ]; then
@@ -9,48 +9,50 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "🎮 PS5 SMART PARTY MONITOR"
-sleep 1
+echo "🎮 PS5 REAL ACTIVITY MONITOR"
+echo ""
 
 read -p "Enter PS5 IP: " PS5_IP
-read -p "Enter interface (wifi/hotspot): " IFACE
 
-DATA="/tmp/ps5_data.txt"
-LAST="/tmp/ps5_last.txt"
-RATE="/tmp/ps5_rate.txt"
+echo ""
+echo "[*] Detecting active interfaces..."
 
-> $DATA
-> $LAST
-> $RATE
+# Find interfaces with traffic
+IFS=$'\n'
+INTERFACES=($(ip -o link show | awk -F': ' '{print $2}'))
 
-echo "[+] Starting capture..."
+BEST_IF=""
+BEST_COUNT=0
 
-# Capture traffic
-tcpdump -i $IFACE host $PS5_IP -nn -l 2>/dev/null | while read line; do
-    NOW=$(date +%s)
+for IFACE in "${INTERFACES[@]}"; do
+    COUNT=$(timeout 2 tcpdump -i "$IFACE" host "$PS5_IP" -nn 2>/dev/null | wc -l)
+    if [ "$COUNT" -gt "$BEST_COUNT" ]; then
+        BEST_COUNT=$COUNT
+        BEST_IF=$IFACE
+    fi
+done
 
-    # Count packets for rate detection
-    echo "$NOW" >> $RATE
+if [ -z "$BEST_IF" ] || [ "$BEST_COUNT" -eq 0 ]; then
+    echo "❌ No traffic detected from PS5"
+    echo "👉 Make sure:"
+    echo "   - PS5 is ON"
+    echo "   - Same network"
+    echo "   - Correct IP"
+    exit 1
+fi
 
-    echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}\.[0-9]+' | while read ep; do
-        IP=$(echo $ep | sed 's/\.[0-9]*$//')
-        PORT=$(echo $ep | grep -oE '[0-9]+$')
+echo "✅ Using interface: $BEST_IF"
+sleep 1
 
-        if [ "$IP" != "$PS5_IP" ]; then
-            KEY="$IP:$PORT"
+RATE_FILE="/tmp/ps5_rate.txt"
+> $RATE_FILE
 
-            # Track last seen
-            grep -v "^$KEY " $LAST > ${LAST}.tmp
-            echo "$KEY $NOW" >> ${LAST}.tmp
-            mv ${LAST}.tmp $LAST
+echo "[+] Monitoring started..."
+sleep 1
 
-            # New connection alert
-            if ! grep -q "^$KEY$" "$DATA"; then
-                echo "$KEY" >> "$DATA"
-                echo "[NEW] $KEY"
-            fi
-        fi
-    done
+# Capture traffic (lightweight)
+tcpdump -i "$BEST_IF" host "$PS5_IP" -nn -l 2>/dev/null | while read line; do
+    echo "$(date +%s)" >> $RATE_FILE
 done &
 
 # Display loop
@@ -58,67 +60,38 @@ while true; do
     clear
     NOW=$(date +%s)
 
-    echo "🎮 PS5 SMART MONITOR"
+    echo "🎮 PS5 ACTIVITY MONITOR"
     echo "Time: $(date)"
-    echo "Target: $PS5_IP"
-    echo "Interface: $IFACE"
+    echo "PS5: $PS5_IP"
+    echo "Interface: $BEST_IF"
     echo "======================================"
 
-    sort $DATA | uniq > /tmp/ps5_unique.txt
-    COUNT=$(wc -l < /tmp/ps5_unique.txt)
+    # Packet rate (last 2 seconds)
+    RATE=$(awk -v now=$NOW '$1 > now-2' $RATE_FILE | wc -l)
 
-    # VPN detection (very useful)
-    UNIQUE_IPS=$(cut -d: -f1 /tmp/ps5_unique.txt | sort | uniq | wc -l)
-    if [ "$UNIQUE_IPS" -le 2 ]; then
-        echo "⚠️ VPN LIKELY ACTIVE (low peer count)"
+    echo "📊 Packets (last 2s): $RATE"
+
+    # Activity interpretation
+    if [ "$RATE" -lt 5 ]; then
+        echo "😴 Idle / no party activity"
+    elif [ "$RATE" -lt 30 ]; then
+        echo "🎮 Normal gameplay traffic"
+    elif [ "$RATE" -lt 80 ]; then
+        echo "💬 Party activity detected"
     else
-        echo "🌐 Direct Connections Detected"
+        echo "🎤 Voice spike (someone talking)"
     fi
 
-    echo "Endpoints: $COUNT"
-    echo ""
+    # VPN detection hint
+    UNIQUE_IPS=$(timeout 2 tcpdump -i "$BEST_IF" host "$PS5_IP" -nn 2>/dev/null \
+        | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+        | sort | uniq | wc -l)
 
-    # Packet rate (voice/activity detection)
-    RECENT=$(awk -v now=$NOW '$1 > now-2' $RATE | wc -l)
-    echo "📊 Traffic Rate: $RECENT pkts/2s"
-
-    if [ "$RECENT" -gt 50 ]; then
-        echo "🎤 High activity (possible voice/chat spike)"
+    if [ "$UNIQUE_IPS" -le 2 ]; then
+        echo ""
+        echo "⚠️ Likely VPN or PSN relay (limited visibility)"
     fi
 
-    echo ""
-    echo "--------------------------------------"
-
-    while read ep; do
-        LAST_SEEN=$(grep "^$ep " $LAST | tail -n1 | awk '{print $2}')
-        AGE=$((NOW - LAST_SEEN))
-
-        if [ "$AGE" -lt 3 ]; then
-            STATUS="🟢 ACTIVE"
-        else
-            STATUS="🔴 IDLE"
-        fi
-
-        IP=$(echo $ep | cut -d: -f1)
-
-        # Classify traffic
-        if echo "$IP" | grep -qE "^(10\.|172\.16\.|192\.168\.)"; then
-            TYPE="🏠 LOCAL"
-        else
-            TYPE="🌍 INTERNET"
-        fi
-
-        # Voice ports
-        if echo "$ep" | grep -qE "3478|3479|3480"; then
-            ACT="🎤 VOICE"
-        else
-            ACT=""
-        fi
-
-        echo "$ep | $TYPE | $STATUS $ACT"
-    done < /tmp/ps5_unique.txt
-
-    echo ""
     echo "======================================"
     sleep 2
 done
